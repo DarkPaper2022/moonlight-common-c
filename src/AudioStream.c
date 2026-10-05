@@ -66,7 +66,8 @@ static void AudioPingThreadProc(void* context) {
 
 // Initialize the audio stream and start
 int initializeAudioStream(void) {
-    LbqInitializeLinkedBlockingQueue(&packetQueue, 30);
+    // Increased queue capacity from 30 to 300 (1.5s) to tolerate massive Wi-Fi jitter / high reservoir bursts
+    LbqInitializeLinkedBlockingQueue(&packetQueue, 300);
     RtpaInitializeQueue(&rtpAudioQueue);
     lastSeq = 0;
     receivedDataFromPeer = false;

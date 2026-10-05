@@ -5,8 +5,9 @@
 typedef struct _reed_solomon reed_solomon;
 
 // Maximum time to wait for an OOS data/FEC shard
-// after the entire FEC block should have been received
-#define RTPQ_OOS_WAIT_TIME_MS 10
+// after the entire FEC block should have been received.
+// Raised to 200ms to allow massive bursts and packet recoveries without premature drop.
+#define RTPQ_OOS_WAIT_TIME_MS 200
 
 #define RTPA_DATA_SHARDS 4
 #define RTPA_FEC_SHARDS 2
