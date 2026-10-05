@@ -71,3 +71,4 @@ void PltWaitForConditionVariable(PLT_COND* cond, PLT_MUTEX* mutex);
 
 void PltSleepMs(int ms);
 void PltSleepMsInterruptible(PLT_THREAD* thread, int ms);
+void PltSleepUs(int us);

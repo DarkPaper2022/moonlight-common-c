@@ -170,10 +170,6 @@ static void decodeInputData(PQUEUED_AUDIO_PACKET packet) {
     }
 
     PRTP_PACKET rtp = (PRTP_PACKET)&packet->data[0];
-    if (lastSeq != 0 && (unsigned short)(lastSeq + 1) != rtp->sequenceNumber) {
-        Limelog("Network dropped audio data (expected %d, but received %d)\n", lastSeq + 1, rtp->sequenceNumber);
-    }
-
     lastSeq = rtp->sequenceNumber;
 
     if (AudioEncryptionEnabled) {
@@ -383,22 +379,172 @@ static void AudioReceiveThreadProc(void* context) {
     }
 }
 
+#define DEFAULT_AUDIO_PLAYOUT_DELAY_MS 150
+static uint32_t TargetPlayoutDelayMs = DEFAULT_AUDIO_PLAYOUT_DELAY_MS;
+
+void LiSetAudioPlayoutDelayMs(uint32_t delayMs) {
+    if (delayMs > 0 && delayMs <= 1000) {
+        TargetPlayoutDelayMs = delayMs;
+        Limelog("Audio playout target delay set to %u ms\n", TargetPlayoutDelayMs);
+    }
+}
+
+uint32_t LiGetAudioPlayoutDelayMs(void) {
+    return TargetPlayoutDelayMs;
+}
+
 static void AudioDecoderThreadProc(void* context) {
     int err;
-    PQUEUED_AUDIO_PACKET packet;
+    bool playoutStarted = false;
+    uint16_t nextSequenceNumber = 0;
+    uint64_t nextPlayoutTimeUs = 0;
+    uint32_t frameCount = 0;
+    const uint64_t frameDurationUs = (uint64_t)AudioPacketDuration * 1000;
+    const uint64_t targetDelayUs = (uint64_t)TargetPlayoutDelayMs * 1000;
+
+    Limelog("Audio decoder thread initialized with %u ms fixed-delay playout scheduler\n", TargetPlayoutDelayMs);
 
     while (!PltIsThreadInterrupted(&decoderThread)) {
-        err = LbqWaitForQueueElement(&packetQueue, (void**)&packet);
-        if (err != LBQ_SUCCESS) {
-            // An exit signal was received
+        if (!playoutStarted) {
+            PQUEUED_AUDIO_PACKET firstPacket = NULL;
+            err = LbqWaitForQueueElement(&packetQueue, (void**)&firstPacket);
+            if (err != LBQ_SUCCESS) {
+                return;
+            }
+
+            if (firstPacket->header.size == 0) {
+                free(firstPacket);
+                continue;
+            }
+
+            PRTP_PACKET rtp = (PRTP_PACKET)&firstPacket->data[0];
+            nextSequenceNumber = rtp->sequenceNumber;
+            nextPlayoutTimeUs = PltGetMicroseconds() + targetDelayUs;
+            playoutStarted = true;
+            frameCount = 0;
+
+            Limelog("Audio playout started: initial seq=%u, targetDelay=%u ms\n",
+                    nextSequenceNumber, TargetPlayoutDelayMs);
+
+            while (!PltIsThreadInterrupted(&decoderThread)) {
+                uint64_t now = PltGetMicroseconds();
+                if (now >= nextPlayoutTimeUs) {
+                    break;
+                }
+                uint64_t remaining = nextPlayoutTimeUs - now;
+                int sleepChunk = (remaining > 5000) ? 5000 : (int)remaining;
+                PltSleepUs(sleepChunk);
+            }
+
+            if (PltIsThreadInterrupted(&decoderThread)) {
+                free(firstPacket);
+                return;
+            }
+
+            decodeInputData(firstPacket);
+            free(firstPacket);
+
+            nextSequenceNumber++;
+            nextPlayoutTimeUs += frameDurationUs;
+            continue;
+        }
+
+        uint64_t nowUs = PltGetMicroseconds();
+
+        // 1. Wait until scheduled playout time arrives
+        if (nowUs < nextPlayoutTimeUs) {
+            uint64_t waitUs = nextPlayoutTimeUs - nowUs;
+            if (waitUs > 1000) {
+                int sleepChunk = (waitUs > 5000) ? 5000 : (int)(waitUs - 500);
+                PltSleepUs(sleepChunk);
+                continue;
+            } else {
+                PltSleepUs((int)waitUs);
+                continue;
+            }
+        }
+
+        // 2. Severe desync check: if playback lagged by > 500ms, resynchronize timeline
+        if (nowUs > nextPlayoutTimeUs + 500000) {
+            Limelog("Audio playout lagged behind by %llu ms! Resynchronizing...\n",
+                    (unsigned long long)(nowUs - nextPlayoutTimeUs) / 1000);
+            playoutStarted = false;
+            continue;
+        }
+
+        // 3. Smooth drift tracking: check queue level every ~1s (200 frames)
+        frameCount++;
+        if (frameCount >= 200) {
+            frameCount = 0;
+            int queueDepth = LbqGetItemCount(&packetQueue);
+            int targetDepth = (int)(targetDelayUs / frameDurationUs);
+            if (queueDepth > targetDepth + 4) {
+                nextPlayoutTimeUs -= 1000;
+            } else if (queueDepth < targetDepth - 4 && queueDepth > 0) {
+                nextPlayoutTimeUs += 1000;
+            }
+        }
+
+        // 4. Time to play nextSequenceNumber
+        PQUEUED_AUDIO_PACKET head = NULL;
+        err = LbqPeekQueueElement(&packetQueue, (void**)&head);
+        if (err == LBQ_INTERRUPTED) {
             return;
         }
 
-        decodeInputData(packet);
+        if (err == LBQ_NO_ELEMENT) {
+            // Buffer empty: Wi-Fi jitter spike or loss > targetDelay, synthesize 1 PLC frame
+            AudioCallbacks.decodeAndPlaySample(NULL, 0);
+            nextSequenceNumber++;
+            nextPlayoutTimeUs += frameDurationUs;
+            continue;
+        }
 
-        free(packet);
+        if (head->header.size == 0) {
+            // Explicit loss marker from FEC recovery
+            LbqPollQueueElement(&packetQueue, (void**)&head);
+            AudioCallbacks.decodeAndPlaySample(NULL, 0);
+            free(head);
+            nextSequenceNumber++;
+            nextPlayoutTimeUs += frameDurationUs;
+            continue;
+        }
+
+        PRTP_PACKET rtp = (PRTP_PACKET)&head->data[0];
+        int16_t diff = (int16_t)(rtp->sequenceNumber - nextSequenceNumber);
+
+        if (diff == 0) {
+            // Exact on-time frame
+            LbqPollQueueElement(&packetQueue, (void**)&head);
+            decodeInputData(head);
+            free(head);
+            nextSequenceNumber++;
+            nextPlayoutTimeUs += frameDurationUs;
+        } else if (diff < 0) {
+            if (diff < -40) {
+                // Massive backward jump: resync timeline to this packet
+                Limelog("Audio sequence jumped backward by %d, resyncing to %u\n", -diff, rtp->sequenceNumber);
+                nextSequenceNumber = rtp->sequenceNumber;
+                continue;
+            }
+            // Late packet: playout deadline already passed, discard
+            LbqPollQueueElement(&packetQueue, (void**)&head);
+            free(head);
+        } else { // diff > 0
+            if (diff > 40) {
+                // Massive forward jump (>200ms gap): resync timeline to this packet
+                Limelog("Audio sequence jumped forward by %d, resyncing to %u\n", diff, rtp->sequenceNumber);
+                nextSequenceNumber = rtp->sequenceNumber;
+                continue;
+            }
+            // Sequence hole: missing packet, synthesize 1 PLC frame
+            AudioCallbacks.decodeAndPlaySample(NULL, 0);
+            nextSequenceNumber++;
+            nextPlayoutTimeUs += frameDurationUs;
+        }
     }
 }
+
 
 void stopAudioStream(void) {
     if (!receivedDataFromPeer) {

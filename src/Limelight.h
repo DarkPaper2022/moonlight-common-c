@@ -879,6 +879,13 @@ int LiGetPendingAudioFrames(void);
 // negotiated audio frame duration.
 int LiGetPendingAudioDuration(void);
 
+// Sets the target playout delay (in milliseconds) for the fixed-delay audio playout scheduler.
+// Default is 100 ms.
+void LiSetAudioPlayoutDelayMs(uint32_t delayMs);
+
+// Gets the current target playout delay in milliseconds.
+uint32_t LiGetAudioPlayoutDelayMs(void);
+
 // Returns a pointer to a struct containing various statistics about the RTP audio stream.
 // The data should be considered read-only and must not be modified.
 typedef struct _RTP_AUDIO_STATS {
