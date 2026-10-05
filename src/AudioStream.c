@@ -1,6 +1,61 @@
 #include "Limelight-internal.h"
+#include "AudioBurstRecovery.h"
 
 static SOCKET rtpSocket = INVALID_SOCKET;
+
+static bool burstGuardEnabled = false;
+static uint32_t burstRecoveryWindowMs = 150;
+static uint32_t burstPcmQueueMs = 20;
+static AUDIO_BURST_GUARD burstGuard;
+
+void LiSetAudioBurstGuardEnabled(bool enabled) {
+    burstGuardEnabled = enabled;
+    Limelog("AudioBurstGuard: enabled set to %d\n", enabled);
+}
+
+bool LiGetAudioBurstGuardEnabled(void) {
+    return burstGuardEnabled;
+}
+
+void LiSetAudioRecoveryWindowMs(uint32_t windowMs) {
+    burstRecoveryWindowMs = (windowMs > 0) ? windowMs : 150;
+    Limelog("AudioBurstGuard: recoveryWindowMs set to %u\n", burstRecoveryWindowMs);
+}
+
+uint32_t LiGetAudioRecoveryWindowMs(void) {
+    return burstRecoveryWindowMs;
+}
+
+void LiSetAudioPcmQueueMs(uint32_t pcmMs) {
+    burstPcmQueueMs = (pcmMs > 0) ? pcmMs : 20;
+    Limelog("AudioBurstGuard: pcmQueueMs set to %u\n", burstPcmQueueMs);
+}
+
+uint32_t LiGetAudioPcmQueueMs(void) {
+    return burstPcmQueueMs;
+}
+
+static uint64_t legacyTotalAudioFrames = 0;
+static uint64_t legacyPlcAudioFrames = 0;
+
+bool LiGetAudioStats(PAUDIO_STATS stats) {
+    if (stats == NULL) {
+        return false;
+    }
+    if (burstGuardEnabled) {
+        return AudioBurstGuardGetStats(&burstGuard, stats);
+    } else {
+        stats->totalFrames = legacyTotalAudioFrames;
+        stats->plcFrames = legacyPlcAudioFrames;
+        stats->originalFrames = (legacyTotalAudioFrames >= legacyPlcAudioFrames) ?
+            (legacyTotalAudioFrames - legacyPlcAudioFrames) : 0;
+        stats->duplicateFrames = 0;
+        stats->fecFrames = 0;
+        stats->lossRatePercent = (legacyTotalAudioFrames > 0) ?
+            ((float)legacyPlcAudioFrames * 100.0f / (float)legacyTotalAudioFrames) : 0.0f;
+        return true;
+    }
+}
 
 static LINKED_BLOCKING_QUEUE packetQueue;
 static RTP_AUDIO_QUEUE rtpAudioQueue;
@@ -319,6 +374,11 @@ static void AudioReceiveThreadProc(void* context) {
         rtp->timestamp = BE32(rtp->timestamp);
         rtp->ssrc = BE32(rtp->ssrc);
 
+        if (burstGuardEnabled) {
+            AudioBurstGuardIngest(&burstGuard, (const uint8_t*)&packet->data[0], (uint16_t)packet->header.size, PltGetMicroseconds());
+            continue;
+        }
+
         queueStatus = RtpaAddPacket(&rtpAudioQueue, (PRTP_PACKET)&packet->data[0], (uint16_t)packet->header.size);
         if (RTPQ_HANDLE_NOW(queueStatus)) {
             if ((AudioCallbacks.capabilities & CAPABILITY_DIRECT_SUBMIT) == 0) {
@@ -402,9 +462,37 @@ static void AudioDecoderThreadProc(void* context) {
     const uint64_t frameDurationUs = (uint64_t)AudioPacketDuration * 1000;
     const uint64_t targetDelayUs = (uint64_t)TargetPlayoutDelayMs * 1000;
 
-    Limelog("Audio decoder thread initialized with %u ms fixed-delay playout scheduler\n", TargetPlayoutDelayMs);
+    Limelog("Audio decoder thread initialized (burstGuardEnabled=%d, playoutDelay=%u ms)\n",
+            burstGuardEnabled, TargetPlayoutDelayMs);
 
     while (!PltIsThreadInterrupted(&decoderThread)) {
+        if (burstGuardEnabled) {
+            uint64_t now = PltGetMicroseconds();
+            uint64_t nextDeadline = AudioBurstGuardGetNextDeadlineUs(&burstGuard);
+            if (nextDeadline == 0 || now < nextDeadline) {
+                uint64_t waitUs = (nextDeadline > now) ? (nextDeadline - now) : 2000;
+                int sleepChunk = (waitUs > 2000) ? 2000 : (int)waitUs;
+                PltSleepUs(sleepChunk);
+                continue;
+            }
+
+            uint16_t outLen = 0, outSeq = 0;
+            BURST_FRAME_STATUS status;
+            uint8_t* payload = AudioBurstGuardFinalizeNext(&burstGuard, now, &outLen, &outSeq, &status);
+            if (payload != NULL) {
+                // Wrap in QUEUED_AUDIO_PACKET for decodeInputData
+                QUEUED_AUDIO_PACKET qp;
+                qp.header.size = outLen;
+                memcpy(&qp.data[0], payload, outLen);
+                free(payload);
+                decodeInputData(&qp);
+            } else {
+                // Missing at deadline -> synthesize PLC
+                AudioCallbacks.decodeAndPlaySample(NULL, 0);
+            }
+            continue;
+        }
+
         if (!playoutStarted) {
             PQUEUED_AUDIO_PACKET firstPacket = NULL;
             err = LbqWaitForQueueElement(&packetQueue, (void**)&firstPacket);
@@ -495,6 +583,8 @@ static void AudioDecoderThreadProc(void* context) {
         if (err == LBQ_NO_ELEMENT) {
             // Buffer empty: Wi-Fi jitter spike or loss > targetDelay, synthesize 1 PLC frame
             AudioCallbacks.decodeAndPlaySample(NULL, 0);
+            legacyPlcAudioFrames++;
+            legacyTotalAudioFrames++;
             nextSequenceNumber++;
             nextPlayoutTimeUs += frameDurationUs;
             continue;
@@ -504,6 +594,8 @@ static void AudioDecoderThreadProc(void* context) {
             // Explicit loss marker from FEC recovery
             LbqPollQueueElement(&packetQueue, (void**)&head);
             AudioCallbacks.decodeAndPlaySample(NULL, 0);
+            legacyPlcAudioFrames++;
+            legacyTotalAudioFrames++;
             free(head);
             nextSequenceNumber++;
             nextPlayoutTimeUs += frameDurationUs;
@@ -517,6 +609,7 @@ static void AudioDecoderThreadProc(void* context) {
             // Exact on-time frame
             LbqPollQueueElement(&packetQueue, (void**)&head);
             decodeInputData(head);
+            legacyTotalAudioFrames++;
             free(head);
             nextSequenceNumber++;
             nextPlayoutTimeUs += frameDurationUs;
@@ -539,6 +632,8 @@ static void AudioDecoderThreadProc(void* context) {
             }
             // Sequence hole: missing packet, synthesize 1 PLC frame
             AudioCallbacks.decodeAndPlaySample(NULL, 0);
+            legacyPlcAudioFrames++;
+            legacyTotalAudioFrames++;
             nextSequenceNumber++;
             nextPlayoutTimeUs += frameDurationUs;
         }
@@ -552,6 +647,10 @@ void stopAudioStream(void) {
     }
 
     AudioCallbacks.stop();
+
+    if (burstGuardEnabled) {
+        AudioBurstGuardCleanup(&burstGuard);
+    }
 
     PltInterruptThread(&receiveThread);
     if ((AudioCallbacks.capabilities & CAPABILITY_DIRECT_SUBMIT) == 0) {
@@ -592,6 +691,13 @@ int startAudioStream(void* audioContext, int arFlags) {
     }
 
     AudioCallbacks.start();
+
+    legacyTotalAudioFrames = 0;
+    legacyPlcAudioFrames = 0;
+
+    if (burstGuardEnabled) {
+        AudioBurstGuardInit(&burstGuard, burstRecoveryWindowMs, burstPcmQueueMs);
+    }
 
     err = PltCreateThread("AudioRecv", AudioReceiveThreadProc, NULL, &receiveThread);
     if (err != 0) {

@@ -543,7 +543,8 @@ static void handleMissingPackets(PRTP_AUDIO_QUEUE queue) {
 
     // At this point, we know we've got a second FEC block queued up waiting on the first one to complete.
     // Wait for the timeout before declaring FEC recovery failed, giving Wi-Fi burst packets time to arrive.
-    if (PltGetMicroseconds() - queue->blockHead->queueTimeUs > (uint64_t)(AudioPacketDuration * RTPA_DATA_SHARDS) + (RTPQ_OOS_WAIT_TIME_MS * 1000)) {
+    uint64_t legacy_wait_us = ((uint64_t)AudioPacketDuration * RTPA_DATA_SHARDS + RTPQ_OOS_WAIT_TIME_MS) * 1000;
+    if (PltGetMicroseconds() - queue->blockHead->queueTimeUs > legacy_wait_us) {
         LC_ASSERT(!isBefore16(queue->nextRtpSequenceNumber, queue->blockHead->fecHeader.baseSequenceNumber));
 
         queue->stats.packetCountFecFailed++;

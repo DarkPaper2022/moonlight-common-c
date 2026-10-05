@@ -1020,6 +1020,24 @@ bool LiGetHdrMetadata(PSS_HDR_METADATA metadata);
 // frame, just that an IDR frame will arrive soon.
 void LiRequestIdrFrame(void);
 
+// Audio Burst Guard Configuration and Statistics
+typedef struct _AUDIO_STATS {
+    uint64_t totalFrames;          // Total media frames evaluated at deadline
+    uint64_t plcFrames;            // Lost frames (both packets missed -> PLC interpolation)
+    uint64_t originalFrames;       // Original frames delivered on time
+    uint64_t duplicateFrames;      // Frames rescued by temporal duplicate (120ms)
+    uint64_t fecFrames;            // Frames rescued by RS FEC
+    float lossRatePercent;         // plcFrames * 100.0f / totalFrames
+} AUDIO_STATS, *PAUDIO_STATS;
+
+void LiSetAudioBurstGuardEnabled(bool enabled);
+bool LiGetAudioBurstGuardEnabled(void);
+void LiSetAudioRecoveryWindowMs(uint32_t windowMs);
+uint32_t LiGetAudioRecoveryWindowMs(void);
+void LiSetAudioPcmQueueMs(uint32_t pcmMs);
+uint32_t LiGetAudioPcmQueueMs(void);
+bool LiGetAudioStats(PAUDIO_STATS stats);
+
 // This function returns any extended feature flags supported by the host.
 #define LI_FF_PEN_TOUCH_EVENTS        0x01 // LiSendTouchEvent()/LiSendPenEvent() supported
 #define LI_FF_CONTROLLER_TOUCH_EVENTS 0x02 // LiSendControllerTouchEvent() supported
