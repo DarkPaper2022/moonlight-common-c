@@ -4,6 +4,18 @@ Moonlight-common-c contains the core GameStream client code shared between [Moon
 
 If you are implementing your own Moonlight game streaming client that can use a C library, you probably want the code here.
 
+## Fork additions: AudioBurstGuard (audio anti-jitter)
+
+This fork adds a deadline-driven audio recovery path for lossy wireless
+links with periodic blackouts (e.g. Apple AWDL coexistence scans):
+host-side temporal redundancy (every audio packet re-sent +120ms) plus
+client-side slot reordering with a 150ms recovery window, RS FEC, PLC
+synthesis and live loss statistics (`LiGetAudioStats()`).
+
+See [docs/AudioBurstGuard.md](docs/AudioBurstGuard.md) for the design,
+tuning knobs and validation methodology, and `tests/README.md` for the
+deterministic unit tests and the real-network end-to-end harness.
+
 ## Note to Developers
 
 Moonlight-common-c requires the _specific_ version of ENet that is bundled as a submodule. This version has changes required for IPv6 compatibility and retransmission reliability, among other things. These are breaking API/ABI changes which make Moonlight-common-c incompatible with other versions of the ENet library. Attempting to runtime link to another libenet library will cause your client to crash when connecting to recent versions of GeForce Experience.
