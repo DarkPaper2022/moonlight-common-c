@@ -37,9 +37,11 @@ typedef struct _AUDIO_BURST_GUARD {
     uint32_t pcmTargetQueueMs;     // Default: 20 ms
     uint64_t anchorLocalUs;
     uint16_t anchorSeq;
+    uint32_t anchorRtpTs;          // Server RTP timestamp at anchor (drift-free playout clock)
     bool anchored;
 
     uint16_t nextExpectedSeq;
+    uint32_t nextExpectedRtpTs;    // Server-clock ts for nextExpectedSeq
     uint64_t nextExpectedDeadlineUs;
 
     // Ring buffer of media frame slots indexed by seq % BURST_SLOT_CAPACITY

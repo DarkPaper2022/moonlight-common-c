@@ -34,13 +34,17 @@ void AudioBurstGuardReset(PAUDIO_BURST_GUARD guard) {
     guard->anchorSeq = 0;
 }
 
-static uint64_t calculateDeadline(PAUDIO_BURST_GUARD guard, uint16_t seq) {
-    uint64_t frameDurationUs = (uint64_t)AudioPacketDuration * 1000;
-    int16_t diff = (int16_t)(seq - guard->anchorSeq);
-    int64_t nominalUs = (int64_t)guard->anchorLocalUs + ((int64_t)diff * (int64_t)frameDurationUs);
+static uint64_t calculateDeadlineTs(PAUDIO_BURST_GUARD guard, uint32_t ts) {
+    // Drift-free pacing: the server's RTP timestamp clock is the authoritative
+    // audio timeline. Pacing playout on the local free-running clock caused
+    // periodic underruns whenever the two crystals diverged (ppm-level drift
+    // drains the queue -> PLC burst -> audible stutter every ~15-60s).
+    int32_t tsDiff = (int32_t)(ts - guard->anchorRtpTs);
+    int64_t nominalUs = (int64_t)guard->anchorLocalUs + ((int64_t)tsDiff * 1000);
     if (nominalUs < 0) nominalUs = 0;
     return (uint64_t)nominalUs + ((uint64_t)guard->recoveryWindowMs * 1000);
 }
+
 
 bool AudioBurstGuardIngest(PAUDIO_BURST_GUARD guard, const uint8_t* datagram, uint16_t length, uint64_t nowUs) {
     if (!guard->enabled || length < sizeof(RTP_PACKET)) {
@@ -59,26 +63,20 @@ bool AudioBurstGuardIngest(PAUDIO_BURST_GUARD guard, const uint8_t* datagram, ui
             guard->anchored = true;
             guard->anchorSeq = seq;
             guard->anchorLocalUs = nowUs;
+            guard->anchorRtpTs = ts;
 
             // Anchor establishes the timeline. The initial expected sequence number is seq.
             guard->nextExpectedSeq = seq;
-            guard->nextExpectedDeadlineUs = calculateDeadline(guard, seq);
-        } else {
-            // If we receive a packet before our anchorSeq (e.g. duplicate of an earlier packet that was lost during initial blackout)
-            int16_t diffAnchor = (int16_t)(seq - guard->anchorSeq);
-            if (diffAnchor < 0) {
-                // Re-anchor to the earlier packet so that its deadline and timeline are correctly maintained
-                uint64_t frameDurationUs = (uint64_t)AudioPacketDuration * 1000;
-                int64_t shiftUs = (int64_t)(-diffAnchor) * (int64_t)frameDurationUs;
-                if ((int64_t)guard->anchorLocalUs >= shiftUs) {
-                    guard->anchorLocalUs -= shiftUs;
-                } else {
-                    guard->anchorLocalUs = 0;
-                }
-                guard->anchorSeq = seq;
-                guard->nextExpectedSeq = seq;
-                guard->nextExpectedDeadlineUs = calculateDeadline(guard, seq);
-            }
+            guard->nextExpectedRtpTs = ts;
+            guard->nextExpectedDeadlineUs = calculateDeadlineTs(guard, ts);
+        } else if ((int16_t)(seq - guard->nextExpectedSeq) < 0) {
+            // Late duplicate of an already-played frame: sliding-window check vs
+            // nextExpectedSeq (standard RTP sequence math). The old static-anchor
+            // comparison overflowed after 32768 frames (~2.7 min) and triggered a
+            // catastrophic re-anchor (anchorLocalUs clamped to 0) -> permanent
+            // PLC avalanche. That was the periodic multi-minute audio stutter.
+            guard->countLateDiscarded++;
+            return false;
         }
 
         // Check if packet is already past its deadline / already finalized
@@ -103,10 +101,12 @@ bool AudioBurstGuardIngest(PAUDIO_BURST_GUARD guard, const uint8_t* datagram, ui
             return true;
         }
 
-        uint64_t frameDurationUs = (uint64_t)AudioPacketDuration * 1000;
-        int16_t diff = (int16_t)(seq - guard->anchorSeq);
-        int64_t nominalUs = (int64_t)guard->anchorLocalUs + ((int64_t)diff * (int64_t)frameDurationUs);
-        bool isDuplicate = (nominalUs >= 0 && nowUs >= (uint64_t)nominalUs + 60000);
+        uint64_t deadlineUs = calculateDeadlineTs(guard, ts);
+        // A frame arriving after its own deadline passed is a delayed duplicate
+        // (its slot was already PLC'd or would have been). Everything else is an
+        // on-time original. (Old seq-vs-anchor heuristic misclassified frames that
+        // arrived early relative to a sliding window.)
+        bool isDuplicate = nowUs >= deadlineUs;
 
         // Allocate and store
         if (slot->payload != NULL) {
@@ -116,7 +116,7 @@ bool AudioBurstGuardIngest(PAUDIO_BURST_GUARD guard, const uint8_t* datagram, ui
 
         slot->sequenceNumber = seq;
         slot->timestamp = ts;
-        slot->deadlineUs = calculateDeadline(guard, seq);
+        slot->deadlineUs = deadlineUs;
         slot->finalized = false;
         slot->length = length;
         slot->payload = malloc(length);
@@ -145,7 +145,7 @@ bool AudioBurstGuardIngest(PAUDIO_BURST_GUARD guard, const uint8_t* datagram, ui
                         if (s->status == BURST_FRAME_EMPTY) {
                             s->sequenceNumber = recSeq;
                             s->timestamp = rec->timestamp;
-                            s->deadlineUs = calculateDeadline(guard, recSeq);
+                            s->deadlineUs = calculateDeadlineTs(guard, rec->timestamp);
                             s->finalized = false;
                             s->length = fecLen;
                             s->payload = malloc(fecLen);
@@ -217,9 +217,10 @@ uint8_t* AudioBurstGuardFinalizeNext(PAUDIO_BURST_GUARD guard, uint64_t nowUs, u
     slot->finalized = true;
     slot->status = BURST_FRAME_EMPTY;
 
-    // Advance next expected sequence number and deadline
+    // Advance next expected sequence number and deadline (server-clock paced)
     guard->nextExpectedSeq++;
-    guard->nextExpectedDeadlineUs = calculateDeadline(guard, guard->nextExpectedSeq);
+    guard->nextExpectedRtpTs += (uint32_t)AudioPacketDuration;
+    guard->nextExpectedDeadlineUs = calculateDeadlineTs(guard, guard->nextExpectedRtpTs);
 
     return resultPayload;
 }
